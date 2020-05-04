@@ -10,6 +10,7 @@
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
+#include <openssl/err.h>
 
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
@@ -75,18 +76,23 @@ public:
         return n;
     }
 
-    int read_and_decapsulate(unsigned char *data, int &len)
+    unsigned char * read_and_decapsulate( int &len, int & ret)
     {
 
         unsigned char *payload = (unsigned char *)malloc(5);
         read_str(payload, 5);
-        int ret = payload[0];
+        ret = payload[0];
         len = payload[4] + 256 * payload[3] + 65536 * payload[2] + 16777216 * payload[1];
         free(payload);
-        data = (unsigned char *)malloc(len);
+        unsigned char * data = (unsigned char *)malloc(len);
         read_str(data, len);
 
-        return ret;
+        if(data==NULL)
+        {
+            ERROR("Could not read data");
+            exit(1);
+        }
+        return data;
     }
 
     void close_tcp()
@@ -97,7 +103,8 @@ public:
 
 class crypto_TH
 {
-    RSA *masterRSA = NULL;
+    RSA *masterRSA = NULL,*AdminmasterRSA=NULL,*currentRSA=NULL,*AdmincurrentRSA=NULL;
+
     unsigned long exp = RSA_F4; //65537
     int keybits = 2048;
 
@@ -166,6 +173,23 @@ public:
         BIO_free_all(prv_bio);
         BN_free(bn);
     }
+
+    void verify_THMasterkey_request(client_socket &sock,unsigned char* THMasterkey_request, int msgsize)
+    {
+        unsigned char* dec_nonce=(unsigned char*)malloc(16);
+        int sz;
+
+        if (sz=RSA_private_decrypt(RSA_size(masterRSA), THMasterkey_request,dec_nonce,masterRSA,RSA_PKCS1_PADDING) == -1)
+        {
+            unsigned long errorTrack = ERR_get_error();
+            char *errorChar = new char[256];
+            errorChar = ERR_error_string(errorTrack, errorChar);
+            cout << errorChar << endl;
+            ERROR("RSA decrypt error");
+            exit(1);
+        }
+        cout<<"Nonce decrypted";
+    }
 };
 
 class FW_update_client
@@ -175,7 +199,11 @@ public:
     void update_sequence(crypto_TH &crypto, client_socket &sock)
     {
         TCP_send_update_request(sock);
-        TCP_wait_for_THMasterkey_request(sock);
+        unsigned char* THMasterkey_request=NULL;
+        int msgsize;
+        THMasterkey_request=  TCP_wait_for_THMasterkey_request(sock,msgsize);
+        
+        crypto.verify_THMasterkey_request(sock,THMasterkey_request,msgsize);
     }
 
 private:
@@ -188,17 +216,26 @@ private:
         sock.write_str(payload, 5);
         free(payload);
     }
-    void TCP_wait_for_THMasterkey_request(client_socket &sock)
+    unsigned char* TCP_wait_for_THMasterkey_request(client_socket &sock,int& payloadlen)
     {
-        unsigned char *payload = NULL;
-        int payloadlen;
-        if (sock.read_and_decapsulate(payload, payloadlen) != THMASTER_REQUEST)
+        
+        int ret;
+        unsigned char* THMasterkey_request=sock.read_and_decapsulate(payloadlen,ret);
+        if( ret!= THMASTER_REQUEST)
         {
             ERROR("Invalid message received");
             exit(1);
         }
+        if(THMasterkey_request==NULL)
+        {
+            ERROR("data null");
+            exit(1);
+        }
+        return THMasterkey_request;
+        
+      
 
-        cout << "Received THMasterkey request";
+      
     }
 };
 

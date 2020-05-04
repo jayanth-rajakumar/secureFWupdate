@@ -87,6 +87,7 @@ public:
     }
     void encapsulate_and_write(unsigned char * str, int len, int messagetype)
     {
+        
         int outlen=5+len;
         unsigned char* payload=(unsigned char*) malloc(outlen);
         payload[0]=messagetype;
@@ -100,6 +101,9 @@ public:
             payload[i]=len%256;
             len=len/256;
         }
+
+        memcpy(payload+5,str,outlen-5);
+
         if(write_str(payload, outlen)!=outlen)
         {
             ERROR("Error writing to socket");
@@ -206,7 +210,7 @@ public:
         fclose(fp);
     }
 
-    void sign_and_encrypt_nonce(unsigned char *sgd_enc_nonce, int &sgd_enc_nonce_len)
+    unsigned char* sign_and_encrypt_nonce( int &sgd_enc_nonce_len)
     {
         keyexchange_nonce = (unsigned char *)malloc(16);
         if (RAND_bytes(keyexchange_nonce, 16) != 1)
@@ -245,14 +249,17 @@ public:
             ERROR("RSA encrypt error");
             exit(1);
         }
+        
+
         sgd_enc_nonce_len = RSA_size(THmasterRSA) + siglen;
-        sgd_enc_nonce = (unsigned char *)malloc(sgd_enc_nonce_len);
+        unsigned char * sgd_enc_nonce = (unsigned char *)malloc(sgd_enc_nonce_len);
         memcpy(sgd_enc_nonce, enc_nonce, RSA_size(THmasterRSA));
-        memcpy(sgd_enc_nonce, sigret, siglen);
+        memcpy(sgd_enc_nonce+RSA_size(THmasterRSA), sigret, siglen);
 
         free(enc_nonce);
         free(sigret);
         free(hash);
+        return sgd_enc_nonce;
     }
 };
 
@@ -296,7 +303,7 @@ public:
         crypto.load_THMasterkey();
         unsigned char *sgd_enc_nonce = NULL;
         int sgd_enc_nonce_len;
-        crypto.sign_and_encrypt_nonce(sgd_enc_nonce, sgd_enc_nonce_len);
+        sgd_enc_nonce=crypto.sign_and_encrypt_nonce( sgd_enc_nonce_len);
 
         sock.encapsulate_and_write(sgd_enc_nonce, sgd_enc_nonce_len, THMASTER_REQUEST);
 
