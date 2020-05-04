@@ -12,6 +12,7 @@
 #include <openssl/evp.h>
 
 #define UPDATE_REQUEST 0
+#define THMASTER_REQUEST 1
 
 using namespace std;
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
@@ -58,11 +59,11 @@ public:
             ERROR("ERROR reading from socket");
             exit(1);
         }
-        printf("Message received: %s\n", str);
+        //printf("Message received: %s\n", str);
         return n;
     }
 
-    void write_str(unsigned char *str, int size)
+    int write_str(unsigned char *str, int size)
     {
 
         int n = write(sockfd, str, size);
@@ -71,6 +72,21 @@ public:
             ERROR("ERROR writing to socket");
             exit(1);
         }
+        return n;
+    }
+
+    int read_and_decapsulate(unsigned char *data, int &len)
+    {
+
+        unsigned char *payload = (unsigned char *)malloc(5);
+        read_str(payload, 5);
+        int ret = payload[0];
+        len = payload[4] + 256 * payload[3] + 65536 * payload[2] + 16777216 * payload[1];
+        free(payload);
+        data = (unsigned char *)malloc(len);
+        read_str(data, len);
+
+        return ret;
     }
 
     void close_tcp()
@@ -83,7 +99,7 @@ class crypto_TH
 {
     RSA *masterRSA = NULL;
     unsigned long exp = RSA_F4; //65537
-    int keybits = 1024;
+    int keybits = 2048;
 
 public:
     int load_masterkey()
@@ -148,7 +164,6 @@ public:
 
         BIO_free_all(pub_bio);
         BIO_free_all(prv_bio);
-        RSA_free(masterRSA);
         BN_free(bn);
     }
 };
@@ -160,7 +175,9 @@ public:
     void update_sequence(crypto_TH &crypto, client_socket &sock)
     {
         TCP_send_update_request(sock);
+        TCP_wait_for_THMasterkey_request(sock);
     }
+
 private:
     void TCP_send_update_request(client_socket &sock)
     {
@@ -170,6 +187,18 @@ private:
             payload[i] = 0;
         sock.write_str(payload, 5);
         free(payload);
+    }
+    void TCP_wait_for_THMasterkey_request(client_socket &sock)
+    {
+        unsigned char *payload = NULL;
+        int payloadlen;
+        if (sock.read_and_decapsulate(payload, payloadlen) != THMASTER_REQUEST)
+        {
+            ERROR("Invalid message received");
+            exit(1);
+        }
+
+        cout << "Received THMasterkey request";
     }
 };
 
@@ -187,9 +216,9 @@ int main(int argc, char *argv[])
 
     crypto_TH crypto;
     crypto.load_masterkey();
-    
+
     FW_update_client update;
-    update.update_sequence(crypto,sock);
+    update.update_sequence(crypto, sock);
 
     sock.close_tcp();
     return 0;

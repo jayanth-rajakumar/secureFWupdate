@@ -1,5 +1,5 @@
 all:
-	g++ client.cpp -o client -lcrypto
-	g++ server.cpp -o server -lcrypto
+	g++ -O0 -g  client.cpp -o client -lcrypto
+	g++ -O0 -g server.cpp -o server -lcrypto
 clean:
 	rm -rf client server *.pem	
