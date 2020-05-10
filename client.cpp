@@ -7,7 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
-#include<assert.h>
+#include <assert.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
@@ -16,6 +16,7 @@
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
 #define THCURRENT_PUBKEY 2
+#define ADMINCURRENT_PUBKEY 3
 
 using namespace std;
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
@@ -97,27 +98,26 @@ public:
         return data;
     }
 
-
-    void encapsulate_and_write(unsigned char * str, int len, int messagetype)
+    void encapsulate_and_write(unsigned char *str, int len, int messagetype)
     {
-        
-        int outlen=5+len;
-        unsigned char* payload=(unsigned char*) malloc(outlen);
-        payload[0]=messagetype;
-        if(len>4294967290)
+
+        int outlen = 5 + len;
+        unsigned char *payload = (unsigned char *)malloc(outlen);
+        payload[0] = messagetype;
+        if (len > 4294967290)
         {
             ERROR("Message too big to send");
             exit(1);
         }
-        for(int i=4;i>=1;i--)
+        for (int i = 4; i >= 1; i--)
         {
-            payload[i]=len%256;
-            len=len/256;
+            payload[i] = len % 256;
+            len = len / 256;
         }
 
-        memcpy(payload+5,str,outlen-5);
+        memcpy(payload + 5, str, outlen - 5);
 
-        if(write_str(payload, outlen)!=outlen)
+        if (write_str(payload, outlen) != outlen)
         {
             ERROR("Error writing to socket");
         }
@@ -244,7 +244,6 @@ public:
     void verify_THMasterkey_request(client_socket &sock, unsigned char *THMasterkey_request, int msgsize)
     {
         unsigned char *dec_nonce = (unsigned char *)malloc(16);
-        
 
         if (RSA_private_decrypt(RSA_size(masterRSA), THMasterkey_request, dec_nonce, masterRSA, RSA_PKCS1_PADDING) == -1)
         {
@@ -273,19 +272,19 @@ public:
         keyexchange_nonce = dec_nonce;
     }
 
-    unsigned char * send_THcurrentkey(client_socket& sock, int& payloadlen)
+    unsigned char *send_THcurrentkey(client_socket &sock, int &payloadlen)
     {
-       
+
         BIO *bio = BIO_new(BIO_s_mem());
         if (PEM_write_bio_RSAPublicKey(bio, currentRSA) != 1)
         {
             ERROR("PEM_write_bio_RSAPublicKey fail");
             exit(1);
         }
-        unsigned char * pkey_pem;
+        unsigned char *pkey_pem;
         int size = BIO_get_mem_data(bio, &pkey_pem);
-        
-        if(size<=0)
+
+        if (size <= 0)
         {
             ERROR("Error getting public key");
             exit(1);
@@ -294,11 +293,11 @@ public:
         unsigned char *for_hashing = (unsigned char *)malloc(16 + size);
 
         memcpy(for_hashing, keyexchange_nonce, 16);
-        memcpy(for_hashing+16, pkey_pem,size);
-        
+        memcpy(for_hashing + 16, pkey_pem, size);
+
         unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
-    
-        if (SHA256(for_hashing, 16+size, hash) == NULL)
+
+        if (SHA256(for_hashing, 16 + size, hash) == NULL)
         {
             ERROR("Hashing Error");
             exit(1);
@@ -316,7 +315,7 @@ public:
             ERROR("Invalid signature created");
             exit(1);
         }
-        
+
         unsigned char *enc_nonce = (unsigned char *)malloc(RSA_size(AdminmasterRSA));
 
         if (RSA_public_encrypt(16, keyexchange_nonce, enc_nonce, AdminmasterRSA, RSA_PKCS1_PADDING) == -1)
@@ -329,18 +328,17 @@ public:
             exit(1);
         }
 
-        int outsize=RSA_size(AdminmasterRSA)+size+siglen;
-        unsigned char* payload=(unsigned char*)malloc(outsize+12);
-        assert(size<256*256);
-        payload[1]=size%256;
-        payload[0]=size/256;
-        memcpy(payload+2,enc_nonce,RSA_size(AdminmasterRSA));
-        memcpy(payload+2+RSA_size(AdminmasterRSA),pkey_pem,size);
-        memcpy(payload+2+RSA_size(AdminmasterRSA)+size,sigret,siglen);
-        
-       
-        payloadlen=outsize+2;
-        
+        int outsize = RSA_size(AdminmasterRSA) + size + siglen;
+        unsigned char *payload = (unsigned char *)malloc(outsize + 2);
+        assert(size < 256 * 256);
+        payload[1] = size % 256;
+        payload[0] = size / 256;
+        memcpy(payload + 2, enc_nonce, RSA_size(AdminmasterRSA));
+        memcpy(payload + 2 + RSA_size(AdminmasterRSA), pkey_pem, size);
+        memcpy(payload + 2 + RSA_size(AdminmasterRSA) + size, sigret, siglen);
+
+        payloadlen = outsize + 2;
+
         free(enc_nonce);
         free(sigret);
         free(hash);
@@ -348,8 +346,60 @@ public:
         free(pkey_pem);
         BIO_free_all(bio);
         return payload;
-        
+    }
+    void verify_load_admincurrentkey(unsigned char *payload, int payloadlen)
+    {
+        int size = payload[1] + payload[0] * 256;
 
+        unsigned char *dec_nonce = (unsigned char *)malloc(16);
+
+        if (RSA_private_decrypt(RSA_size(currentRSA), payload + 2, dec_nonce, currentRSA, RSA_PKCS1_PADDING) == -1)
+        {
+            unsigned long errorTrack = ERR_get_error();
+            char *errorChar = new char[256];
+            errorChar = ERR_error_string(errorTrack, errorChar);
+            cout << errorChar << endl;
+            ERROR("RSA decrypt error");
+            exit(1);
+        }
+
+        if (memcmp(dec_nonce, keyexchange_nonce, 16) != 0)
+        {
+            ERROR("Nonce mismatch. Possible MITM");
+            exit(1);
+        }
+        unsigned char *for_hashing = (unsigned char *)malloc(16 + size);
+        memcpy(for_hashing, dec_nonce, 16);
+        memcpy(for_hashing + 16, payload + 2 + RSA_size(currentRSA), size);
+        unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
+
+        if (SHA256(for_hashing, 16 + size, hash) == NULL)
+        {
+            ERROR("Hashing Error");
+            exit(1);
+        }
+
+        if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, payload + 2 + RSA_size(currentRSA) + size, payloadlen - (2 + RSA_size(currentRSA) + size), AdminmasterRSA) != 1)
+        {
+            ERROR("Invalid signature.");
+            exit(1);
+        }
+
+        BIO *bio = BIO_new_mem_buf((void *)(payload + 2 + RSA_size(currentRSA)), size);
+        PEM_read_bio_RSAPublicKey(bio, &AdmincurrentRSA, 0, NULL);
+
+        if (AdmincurrentRSA == NULL)
+        {
+            ERROR("Error loading THcurrent key");
+            exit(1);
+        }
+
+
+        BIO_free_all(bio);
+        free(for_hashing);
+        free(hash);
+        free(dec_nonce);
+        
     }
 };
 
@@ -367,9 +417,12 @@ public:
         crypto.verify_THMasterkey_request(sock, THMasterkey_request, msgsize);
         crypto.gen_currentkey();
         int payloadlen;
-        unsigned char * payload = crypto.send_THcurrentkey(sock,payloadlen);
-        TCP_send_THcurrentkey(sock,payload,payloadlen);
-         
+        unsigned char *payload = crypto.send_THcurrentkey(sock, payloadlen);
+        TCP_send_THcurrentkey(sock, payload, payloadlen);
+        free(payload);
+        payload = TCP_wait_for_currentkey(sock, payloadlen);
+        crypto.verify_load_admincurrentkey(payload, payloadlen);
+        free(payload);
     }
 
 private:
@@ -399,9 +452,21 @@ private:
         }
         return THMasterkey_request;
     }
-    void TCP_send_THcurrentkey(client_socket& sock,unsigned char *payload,int payloadlen)
+    void TCP_send_THcurrentkey(client_socket &sock, unsigned char *payload, int payloadlen)
     {
-        sock.encapsulate_and_write(payload,payloadlen,THCURRENT_PUBKEY);
+        sock.encapsulate_and_write(payload, payloadlen, THCURRENT_PUBKEY);
+    }
+    unsigned char *TCP_wait_for_currentkey(client_socket &sock, int &payloadlen)
+    {
+        int payloadcode;
+        unsigned char *payload = sock.read_and_decapsulate(payloadlen, payloadcode);
+        if (payloadcode != ADMINCURRENT_PUBKEY)
+        {
+            ERROR("Invalid data");
+            exit(1);
+        }
+
+        return payload;
     }
 };
 

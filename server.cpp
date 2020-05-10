@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <assert.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,6 +18,7 @@
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
 #define THCURRENT_PUBKEY 2
+#define ADMINCURRENT_PUBKEY 3
 
 using namespace std;
 
@@ -316,6 +318,11 @@ public:
             exit(1);
         }
 
+        if (memcmp(dec_nonce, keyexchange_nonce, 16) != 0)
+        {
+            ERROR("Nonce mismatch. Possible MITM");
+            exit(1);
+        }
         unsigned char *for_hashing = (unsigned char *)malloc(16 + size);
         memcpy(for_hashing, dec_nonce, 16);
         memcpy(for_hashing + 16, payload + 2 + RSA_size(masterRSA), size);
@@ -344,11 +351,86 @@ public:
 
         gen_currentkey();
 
+        BIO_free_all(bio);
+        free(for_hashing);
+        free(hash);
+        free(dec_nonce);
     }
 
-    unsigned char * send_Admincurrentkey(int& payloadlen)
+    unsigned char *send_Admincurrentkey(int &payloadlen)
     {
-        return NULL;
+
+        BIO *bio = BIO_new(BIO_s_mem());
+        if (PEM_write_bio_RSAPublicKey(bio, currentRSA) != 1)
+        {
+            ERROR("PEM_write_bio_RSAPublicKey fail");
+            exit(1);
+        }
+        unsigned char *pkey_pem;
+        int size = BIO_get_mem_data(bio, &pkey_pem);
+
+        if (size <= 0)
+        {
+            ERROR("Error getting public key");
+            exit(1);
+        }
+
+        unsigned char *for_hashing = (unsigned char *)malloc(16 + size);
+
+        memcpy(for_hashing, keyexchange_nonce, 16);
+        memcpy(for_hashing + 16, pkey_pem, size);
+
+        unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
+
+        if (SHA256(for_hashing, 16 + size, hash) == NULL)
+        {
+            ERROR("Hashing Error");
+            exit(1);
+        }
+
+        unsigned char *sigret = (unsigned char *)malloc(RSA_size(masterRSA));
+        unsigned int siglen;
+        if (RSA_sign(NID_sha256, hash, SHA256_DIGEST_LENGTH, sigret, &siglen, masterRSA) != 1)
+        {
+            ERROR("RSA signing error");
+            exit(1);
+        }
+        if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, sigret, siglen, masterRSA) != 1)
+        {
+            ERROR("Invalid signature created");
+            exit(1);
+        }
+
+        unsigned char *enc_nonce = (unsigned char *)malloc(RSA_size(THcurrentRSA));
+
+        if (RSA_public_encrypt(16, keyexchange_nonce, enc_nonce, THcurrentRSA, RSA_PKCS1_PADDING) == -1)
+        {
+            unsigned long errorTrack = ERR_get_error();
+            char *errorChar = new char[256];
+            errorChar = ERR_error_string(errorTrack, errorChar);
+            cout << errorChar << endl;
+            ERROR("RSA encrypt error");
+            exit(1);
+        }
+
+        int outsize = RSA_size(THcurrentRSA) + size + siglen;
+        unsigned char *payload = (unsigned char *)malloc(outsize + 2);
+        assert(size < 256 * 256);
+        payload[1] = size % 256;
+        payload[0] = size / 256;
+        memcpy(payload + 2, enc_nonce, RSA_size(THcurrentRSA));
+        memcpy(payload + 2 + RSA_size(THcurrentRSA), pkey_pem, size);
+        memcpy(payload + 2 + RSA_size(THcurrentRSA) + size, sigret, siglen);
+
+        payloadlen = outsize + 2;
+
+        free(enc_nonce);
+        free(sigret);
+        free(hash);
+        free(for_hashing);
+        free(pkey_pem);
+        BIO_free_all(bio);
+        return payload;
     }
 };
 
@@ -363,10 +445,10 @@ public:
         unsigned char *payload = TCP_wait_for_currentkey(sock, payloadlen);
         crypto.verify_gen_currentkey(payload, payloadlen);
         free(payload);
-        payload=NULL;
-        payload=crypto.send_Admincurrentkey(payloadlen);
-
-        
+        payload = NULL;
+        payload = crypto.send_Admincurrentkey(payloadlen);
+        TCP_send_Admincurrentkey(sock,payload,payloadlen);
+        free(payload);
     }
 
     void TCP_wait_for_update_req(socket_admin &sock)
@@ -418,6 +500,11 @@ public:
         }
 
         return payload;
+    }
+
+    void  TCP_send_Admincurrentkey(socket_admin& sock, unsigned char* payload,int payloadlen)
+    {
+        sock.encapsulate_and_write(payload,payloadlen,ADMINCURRENT_PUBKEY);
     }
 };
 int main(int argc, char *argv[])
