@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+#include<assert.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
@@ -14,6 +15,7 @@
 
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
+#define THCURRENT_PUBKEY 2
 
 using namespace std;
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
@@ -76,7 +78,7 @@ public:
         return n;
     }
 
-    unsigned char * read_and_decapsulate( int &len, int & ret)
+    unsigned char *read_and_decapsulate(int &len, int &ret)
     {
 
         unsigned char *payload = (unsigned char *)malloc(5);
@@ -84,15 +86,42 @@ public:
         ret = payload[0];
         len = payload[4] + 256 * payload[3] + 65536 * payload[2] + 16777216 * payload[1];
         free(payload);
-        unsigned char * data = (unsigned char *)malloc(len);
+        unsigned char *data = (unsigned char *)malloc(len);
         read_str(data, len);
 
-        if(data==NULL)
+        if (data == NULL)
         {
             ERROR("Could not read data");
             exit(1);
         }
         return data;
+    }
+
+
+    void encapsulate_and_write(unsigned char * str, int len, int messagetype)
+    {
+        
+        int outlen=5+len;
+        unsigned char* payload=(unsigned char*) malloc(outlen);
+        payload[0]=messagetype;
+        if(len>4294967290)
+        {
+            ERROR("Message too big to send");
+            exit(1);
+        }
+        for(int i=4;i>=1;i--)
+        {
+            payload[i]=len%256;
+            len=len/256;
+        }
+
+        memcpy(payload+5,str,outlen-5);
+
+        if(write_str(payload, outlen)!=outlen)
+        {
+            ERROR("Error writing to socket");
+        }
+        free(payload);
     }
 
     void close_tcp()
@@ -103,13 +132,13 @@ public:
 
 class crypto_TH
 {
-    RSA *masterRSA = NULL,*AdminmasterRSA=NULL,*currentRSA=NULL,*AdmincurrentRSA=NULL;
-
+    RSA *masterRSA = NULL, *AdminmasterRSA = NULL, *currentRSA = NULL, *AdmincurrentRSA = NULL;
+    unsigned char *keyexchange_nonce;
     unsigned long exp = RSA_F4; //65537
     int keybits = 2048;
 
 public:
-    int load_masterkey()
+    void load_masterkey()
     {
         FILE *fp = fopen("THMaster_pub.pem", "r");
 
@@ -174,12 +203,50 @@ public:
         BN_free(bn);
     }
 
-    void verify_THMasterkey_request(client_socket &sock,unsigned char* THMasterkey_request, int msgsize)
+    void gen_currentkey()
     {
-        unsigned char* dec_nonce=(unsigned char*)malloc(16);
-        int sz;
 
-        if (sz=RSA_private_decrypt(RSA_size(masterRSA), THMasterkey_request,dec_nonce,masterRSA,RSA_PKCS1_PADDING) == -1)
+        BIGNUM *bn;
+        bn = BN_new();
+        if (BN_set_word(bn, exp) != 1)
+        {
+            ERROR("BigNum Error");
+            exit(1);
+        }
+
+        currentRSA = RSA_new();
+        if (RSA_generate_key_ex(currentRSA, keybits, bn, NULL) != 1)
+        {
+            ERROR("RSA key gen error");
+            exit(1);
+        }
+        BN_free(bn);
+    }
+
+    void load_AdminMasterkey()
+    {
+        FILE *fp = fopen("ADMINMaster_pub.pem", "r");
+
+        if (fp == NULL)
+        {
+            ERROR("Could not load the Admin master public key. This file should be in the same directory as the client executable");
+            exit(1);
+        }
+        AdminmasterRSA = PEM_read_RSAPublicKey(fp, NULL, NULL, NULL);
+        if (AdminmasterRSA == NULL)
+        {
+            ERROR("Error reading THmasterkey");
+            exit(1);
+        }
+        fclose(fp);
+    }
+
+    void verify_THMasterkey_request(client_socket &sock, unsigned char *THMasterkey_request, int msgsize)
+    {
+        unsigned char *dec_nonce = (unsigned char *)malloc(16);
+        
+
+        if (RSA_private_decrypt(RSA_size(masterRSA), THMasterkey_request, dec_nonce, masterRSA, RSA_PKCS1_PADDING) == -1)
         {
             unsigned long errorTrack = ERR_get_error();
             char *errorChar = new char[256];
@@ -188,7 +255,101 @@ public:
             ERROR("RSA decrypt error");
             exit(1);
         }
-        cout<<"Nonce decrypted";
+
+        unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
+        if (SHA256(dec_nonce, 16, hash) == NULL)
+        {
+            ERROR("Hashing Error");
+            exit(1);
+        }
+        load_AdminMasterkey();
+        if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, THMasterkey_request + RSA_size(AdminmasterRSA), msgsize - RSA_size(AdminmasterRSA), AdminmasterRSA) != 1)
+        {
+            ERROR("Invalid signature created");
+            exit(1);
+        }
+        cout << "Request received and verified\n";
+        free(hash);
+        keyexchange_nonce = dec_nonce;
+    }
+
+    unsigned char * send_THcurrentkey(client_socket& sock, int& payloadlen)
+    {
+       
+        BIO *bio = BIO_new(BIO_s_mem());
+        if (PEM_write_bio_RSAPublicKey(bio, currentRSA) != 1)
+        {
+            ERROR("PEM_write_bio_RSAPublicKey fail");
+            exit(1);
+        }
+        unsigned char * pkey_pem;
+        int size = BIO_get_mem_data(bio, &pkey_pem);
+        
+        if(size<=0)
+        {
+            ERROR("Error getting public key");
+            exit(1);
+        }
+
+        unsigned char *for_hashing = (unsigned char *)malloc(16 + size);
+
+        memcpy(for_hashing, keyexchange_nonce, 16);
+        memcpy(for_hashing+16, pkey_pem,size);
+        
+        unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
+    
+        if (SHA256(for_hashing, 16+size, hash) == NULL)
+        {
+            ERROR("Hashing Error");
+            exit(1);
+        }
+
+        unsigned char *sigret = (unsigned char *)malloc(RSA_size(masterRSA));
+        unsigned int siglen;
+        if (RSA_sign(NID_sha256, hash, SHA256_DIGEST_LENGTH, sigret, &siglen, masterRSA) != 1)
+        {
+            ERROR("RSA signing error");
+            exit(1);
+        }
+        if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, sigret, siglen, masterRSA) != 1)
+        {
+            ERROR("Invalid signature created");
+            exit(1);
+        }
+        
+        unsigned char *enc_nonce = (unsigned char *)malloc(RSA_size(AdminmasterRSA));
+
+        if (RSA_public_encrypt(16, keyexchange_nonce, enc_nonce, AdminmasterRSA, RSA_PKCS1_PADDING) == -1)
+        {
+            unsigned long errorTrack = ERR_get_error();
+            char *errorChar = new char[256];
+            errorChar = ERR_error_string(errorTrack, errorChar);
+            cout << errorChar << endl;
+            ERROR("RSA encrypt error");
+            exit(1);
+        }
+
+        int outsize=RSA_size(AdminmasterRSA)+size+siglen;
+        unsigned char* payload=(unsigned char*)malloc(outsize+12);
+        assert(size<256*256);
+        payload[1]=size%256;
+        payload[0]=size/256;
+        memcpy(payload+2,enc_nonce,RSA_size(AdminmasterRSA));
+        memcpy(payload+2+RSA_size(AdminmasterRSA),pkey_pem,size);
+        memcpy(payload+2+RSA_size(AdminmasterRSA)+size,sigret,siglen);
+        
+       
+        payloadlen=outsize+2;
+        
+        free(enc_nonce);
+        free(sigret);
+        free(hash);
+        free(for_hashing);
+        free(pkey_pem);
+        BIO_free_all(bio);
+        return payload;
+        
+
     }
 };
 
@@ -199,11 +360,16 @@ public:
     void update_sequence(crypto_TH &crypto, client_socket &sock)
     {
         TCP_send_update_request(sock);
-        unsigned char* THMasterkey_request=NULL;
+        unsigned char *THMasterkey_request = NULL;
         int msgsize;
-        THMasterkey_request=  TCP_wait_for_THMasterkey_request(sock,msgsize);
-        
-        crypto.verify_THMasterkey_request(sock,THMasterkey_request,msgsize);
+        THMasterkey_request = TCP_wait_for_THMasterkey_request(sock, msgsize);
+
+        crypto.verify_THMasterkey_request(sock, THMasterkey_request, msgsize);
+        crypto.gen_currentkey();
+        int payloadlen;
+        unsigned char * payload = crypto.send_THcurrentkey(sock,payloadlen);
+        TCP_send_THcurrentkey(sock,payload,payloadlen);
+         
     }
 
 private:
@@ -216,26 +382,26 @@ private:
         sock.write_str(payload, 5);
         free(payload);
     }
-    unsigned char* TCP_wait_for_THMasterkey_request(client_socket &sock,int& payloadlen)
+    unsigned char *TCP_wait_for_THMasterkey_request(client_socket &sock, int &payloadlen)
     {
-        
+
         int ret;
-        unsigned char* THMasterkey_request=sock.read_and_decapsulate(payloadlen,ret);
-        if( ret!= THMASTER_REQUEST)
+        unsigned char *THMasterkey_request = sock.read_and_decapsulate(payloadlen, ret);
+        if (ret != THMASTER_REQUEST)
         {
             ERROR("Invalid message received");
             exit(1);
         }
-        if(THMasterkey_request==NULL)
+        if (THMasterkey_request == NULL)
         {
             ERROR("data null");
             exit(1);
         }
         return THMasterkey_request;
-        
-      
-
-      
+    }
+    void TCP_send_THcurrentkey(client_socket& sock,unsigned char *payload,int payloadlen)
+    {
+        sock.encapsulate_and_write(payload,payloadlen,THCURRENT_PUBKEY);
     }
 };
 
