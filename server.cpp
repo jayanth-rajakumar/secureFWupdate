@@ -10,15 +10,21 @@
 #include <openssl/bn.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/aes.h>
 #include <openssl/err.h>
-
+#include <openssl/evp.h>
+#include<errno.h>
 #include <iostream>
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
+
+#define AES_256_KEY_SIZE 32
+#define AES_BLOCK_SIZE 16
 
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
 #define THCURRENT_PUBKEY 2
 #define ADMINCURRENT_PUBKEY 3
+#define FW_UPDATE 4
 
 using namespace std;
 
@@ -78,6 +84,7 @@ public:
 
     int write_str(unsigned char *str, int size)
     {
+        /*
 
         int n = write(newsockfd, str, size);
         if (n < 0)
@@ -86,6 +93,24 @@ public:
             exit(1);
         }
         return n;
+*/
+        int total_bytes_written = 0;
+        while (total_bytes_written != size)
+        {
+            int bytes_written = write(newsockfd,
+                                      str+total_bytes_written,
+                                      size - total_bytes_written);
+            if (bytes_written == -1)
+            {
+              ERROR("ERROR writing to socket");
+              cout<<strerror(errno);
+              exit(1);
+            }
+            total_bytes_written += bytes_written;
+            
+           // cout<<total_bytes_written<<endl;
+        }
+        return total_bytes_written;
     }
     void encapsulate_and_write(unsigned char *str, int len, int messagetype)
     {
@@ -143,7 +168,8 @@ public:
 class crypto_admin
 {
     RSA *masterRSA = NULL, *THmasterRSA = NULL, *currentRSA = NULL, *THcurrentRSA = NULL;
-
+    unsigned char aes_key[AES_256_KEY_SIZE];
+    unsigned char aes_iv[AES_BLOCK_SIZE];
     unsigned char *keyexchange_nonce = NULL, *update_nonce = NULL;
     unsigned long exp = RSA_F4; //65537
     int keybits = 2048;
@@ -432,6 +458,150 @@ public:
         BIO_free_all(bio);
         return payload;
     }
+
+    unsigned char *prepare_update(char *filename, int &payloadlen)
+    {
+        update_nonce = (unsigned char *)malloc(16);
+        if (RAND_bytes(update_nonce, 16) != 1)
+        {
+            ERROR("PRNG Error");
+            exit(1);
+        } //May fail if PRNG is not seeded properly
+
+        FILE *fp = fopen(filename, "rb");
+        if (fp == NULL)
+        {
+            ERROR("Error opening update binary");
+            exit(1);
+        }
+
+        unsigned char *contents;
+        int filesize;
+        std::fseek(fp, 0, SEEK_END);
+        filesize = ftell(fp);
+        contents = (unsigned char *)malloc(filesize + 16);
+        rewind(fp);
+        fread(&contents[0], sizeof(unsigned char), filesize, fp);
+        fclose(fp);
+
+        memcpy(contents + filesize, update_nonce, 16);
+
+        unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
+
+        if (SHA256(contents, 16 + filesize, hash) == NULL)
+        {
+            ERROR("Hashing Error");
+            exit(1);
+        }
+
+        unsigned char *sigret = (unsigned char *)malloc(RSA_size(currentRSA));
+        unsigned int siglen;
+        if (RSA_sign(NID_sha256, hash, SHA256_DIGEST_LENGTH, sigret, &siglen, currentRSA) != 1)
+        {
+            ERROR("RSA signing error");
+            exit(1);
+        }
+
+        if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, sigret, siglen, currentRSA) != 1)
+        {
+            ERROR("Invalid signature created");
+            exit(1);
+        }
+
+        unsigned char *for_aes = (unsigned char *)malloc(16 + filesize + siglen + 4);
+
+        int fs = filesize;
+        for (int i = 3; i >= 0; i--)
+        {
+            for_aes[i] = fs % 256;
+            fs = fs / 256;
+        }
+
+        memcpy(for_aes + 4, contents, 16 + filesize);
+        memcpy(for_aes + 16 + filesize + 4, sigret, siglen);
+        free(contents);
+
+        int fw_enc_len;
+        unsigned char *fw_enc = AES_encrypt(for_aes, 16 + filesize + siglen + 4, fw_enc_len);
+
+        unsigned char *enc_nonce = (unsigned char *)malloc(RSA_size(THcurrentRSA));
+
+        if (RSA_public_encrypt(16, update_nonce, enc_nonce, THcurrentRSA, RSA_PKCS1_PADDING) == -1)
+        {
+            unsigned long errorTrack = ERR_get_error();
+            char *errorChar = new char[256];
+            errorChar = ERR_error_string(errorTrack, errorChar);
+            cout << errorChar << endl;
+            ERROR("RSA encrypt error");
+            exit(1);
+        }
+
+        payloadlen = fw_enc_len + RSA_size(THcurrentRSA) + AES_BLOCK_SIZE;
+        cout << "Sending " << payloadlen << " bytes";
+        unsigned char *payload = (unsigned char *)malloc(fw_enc_len + RSA_size(THcurrentRSA) + AES_BLOCK_SIZE);
+        memcpy(payload, fw_enc, fw_enc_len);
+        memcpy(payload + fw_enc_len, enc_nonce, RSA_size(THcurrentRSA));
+        memcpy(payload + fw_enc_len + RSA_size(THcurrentRSA), aes_iv, AES_BLOCK_SIZE);
+        free(enc_nonce);
+        free(fw_enc);
+        free(sigret);
+        free(for_aes);
+        free(hash);
+
+        return payload;
+    }
+
+    unsigned char *AES_encrypt(unsigned char *for_aes, int for_aes_len, int &fw_enc_len)
+    {
+      
+        unsigned char *fw_enc = (unsigned char *)malloc(for_aes_len + AES_BLOCK_SIZE);
+        EVP_CIPHER_CTX *ctx;
+        ctx = EVP_CIPHER_CTX_new();
+
+        if (ctx == NULL)
+        {
+            ERROR("Error creating context");
+            exit(1);
+        }
+        /*
+        if (!EVP_CipherInit_ex(ctx, EVP_aes_256_cbc(), NULL, NULL, NULL, 1))
+        {
+            ERROR("Error initializing context");
+            exit(1);
+        }*/
+
+        if (!RAND_bytes(aes_key, sizeof(aes_key)) || !RAND_bytes(aes_iv, sizeof(aes_iv)))
+        {
+            ERROR("RNG Error");
+            exit(1);
+        }
+
+        if (!EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, aes_key, aes_iv))
+        {
+            ERROR("CTX error");
+            exit(1);
+        }
+
+        assert(EVP_CIPHER_CTX_key_length(ctx) == AES_256_KEY_SIZE);
+        assert(EVP_CIPHER_CTX_iv_length(ctx) == AES_BLOCK_SIZE);
+
+        int len2;
+        if (!EVP_EncryptUpdate(ctx, fw_enc, &len2, for_aes, for_aes_len))
+        {
+            ERROR("Error encrypting");
+            exit(1);
+        }
+        fw_enc_len = len2;
+        if (!EVP_EncryptFinal_ex(ctx, fw_enc + len2, &len2))
+        {
+            ERROR("EVP final error");
+            exit(1);
+        }
+
+        fw_enc_len += len2;
+
+        return fw_enc;
+    }
 };
 
 class FW_update_server
@@ -447,7 +617,11 @@ public:
         free(payload);
         payload = NULL;
         payload = crypto.send_Admincurrentkey(payloadlen);
-        TCP_send_Admincurrentkey(sock,payload,payloadlen);
+        TCP_send_Admincurrentkey(sock, payload, payloadlen);
+        free(payload);
+        char filename[] = "fw.bin";
+        payload = crypto.prepare_update(filename, payloadlen);
+        TCP_send_update(sock, payload, payloadlen);
         free(payload);
     }
 
@@ -502,9 +676,15 @@ public:
         return payload;
     }
 
-    void  TCP_send_Admincurrentkey(socket_admin& sock, unsigned char* payload,int payloadlen)
+    void TCP_send_Admincurrentkey(socket_admin &sock, unsigned char *payload, int payloadlen)
     {
-        sock.encapsulate_and_write(payload,payloadlen,ADMINCURRENT_PUBKEY);
+        sock.encapsulate_and_write(payload, payloadlen, ADMINCURRENT_PUBKEY);
+    }
+
+    void TCP_send_update(socket_admin &sock, unsigned char *payload, int payloadlen)
+    {
+
+        sock.encapsulate_and_write(payload, payloadlen, FW_UPDATE);
     }
 };
 int main(int argc, char *argv[])

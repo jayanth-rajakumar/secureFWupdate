@@ -12,12 +12,13 @@
 #include <openssl/pem.h>
 #include <openssl/evp.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
 #define THCURRENT_PUBKEY 2
 #define ADMINCURRENT_PUBKEY 3
-
+#define FW_UPDATE 4
 using namespace std;
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
 
@@ -57,14 +58,19 @@ public:
     int read_str(unsigned char *str, int size)
     {
         bzero(str, size);
-        int n = read(sockfd, str, size);
-        if (n < 0)
+        int bytes_read = 0;
+        while (bytes_read != size)
         {
-            ERROR("ERROR reading from socket");
-            exit(1);
+            int n = read(sockfd, str+bytes_read, size-bytes_read);
+            if (n < 0)
+            {
+                ERROR("ERROR reading from socket");
+                exit(1);
+            }
+            bytes_read+=n;
         }
         //printf("Message received: %s\n", str);
-        return n;
+        return bytes_read;
     }
 
     int write_str(unsigned char *str, int size)
@@ -394,12 +400,16 @@ public:
             exit(1);
         }
 
-
         BIO_free_all(bio);
         free(for_hashing);
         free(hash);
         free(dec_nonce);
-        
+    }
+
+    unsigned char *decrypt_update(unsigned char *payload, int payloadlen, int &updatelen)
+    {
+        cout << "Received update package of " << payloadlen << " bytes";
+        return NULL;
     }
 };
 
@@ -422,6 +432,10 @@ public:
         free(payload);
         payload = TCP_wait_for_currentkey(sock, payloadlen);
         crypto.verify_load_admincurrentkey(payload, payloadlen);
+        free(payload);
+        payload = TCP_receive_update_package(sock, payloadlen);
+        int update_bin_len;
+        unsigned char *update_bin = crypto.decrypt_update(payload, payloadlen, update_bin_len);
         free(payload);
     }
 
@@ -461,6 +475,19 @@ private:
         int payloadcode;
         unsigned char *payload = sock.read_and_decapsulate(payloadlen, payloadcode);
         if (payloadcode != ADMINCURRENT_PUBKEY)
+        {
+            ERROR("Invalid data");
+            exit(1);
+        }
+
+        return payload;
+    }
+
+    unsigned char *TCP_receive_update_package(client_socket &sock, int &payloadlen)
+    {
+        int payloadcode;
+        unsigned char *payload = sock.read_and_decapsulate(payloadlen, payloadcode);
+        if (payloadcode != FW_UPDATE)
         {
             ERROR("Invalid data");
             exit(1);
