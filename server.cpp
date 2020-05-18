@@ -107,8 +107,6 @@ public:
               exit(1);
             }
             total_bytes_written += bytes_written;
-            
-           // cout<<total_bytes_written<<endl;
         }
         return total_bytes_written;
     }
@@ -524,9 +522,9 @@ public:
         int fw_enc_len;
         unsigned char *fw_enc = AES_encrypt(for_aes, 16 + filesize + siglen + 4, fw_enc_len);
 
-        unsigned char *enc_nonce = (unsigned char *)malloc(RSA_size(THcurrentRSA));
+        unsigned char *enc_aes_key = (unsigned char *)malloc(RSA_size(THcurrentRSA));
 
-        if (RSA_public_encrypt(16, update_nonce, enc_nonce, THcurrentRSA, RSA_PKCS1_PADDING) == -1)
+        if (RSA_public_encrypt(AES_256_KEY_SIZE, aes_key, enc_aes_key, THcurrentRSA, RSA_PKCS1_PADDING) == -1)
         {
             unsigned long errorTrack = ERR_get_error();
             char *errorChar = new char[256];
@@ -537,12 +535,12 @@ public:
         }
 
         payloadlen = fw_enc_len + RSA_size(THcurrentRSA) + AES_BLOCK_SIZE;
-        cout << "Sending " << payloadlen << " bytes";
+        cout << "AES Encrypting " << 16 + filesize + siglen + 4<< " bytes\n";
         unsigned char *payload = (unsigned char *)malloc(fw_enc_len + RSA_size(THcurrentRSA) + AES_BLOCK_SIZE);
         memcpy(payload, fw_enc, fw_enc_len);
-        memcpy(payload + fw_enc_len, enc_nonce, RSA_size(THcurrentRSA));
+        memcpy(payload + fw_enc_len, enc_aes_key, RSA_size(THcurrentRSA));
         memcpy(payload + fw_enc_len + RSA_size(THcurrentRSA), aes_iv, AES_BLOCK_SIZE);
-        free(enc_nonce);
+        free(enc_aes_key);
         free(fw_enc);
         free(sigret);
         free(for_aes);

@@ -19,6 +19,10 @@
 #define THCURRENT_PUBKEY 2
 #define ADMINCURRENT_PUBKEY 3
 #define FW_UPDATE 4
+
+#define AES_256_KEY_SIZE 32
+#define AES_BLOCK_SIZE 16
+
 using namespace std;
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
 
@@ -61,13 +65,13 @@ public:
         int bytes_read = 0;
         while (bytes_read != size)
         {
-            int n = read(sockfd, str+bytes_read, size-bytes_read);
+            int n = read(sockfd, str + bytes_read, size - bytes_read);
             if (n < 0)
             {
                 ERROR("ERROR reading from socket");
                 exit(1);
             }
-            bytes_read+=n;
+            bytes_read += n;
         }
         //printf("Message received: %s\n", str);
         return bytes_read;
@@ -142,6 +146,8 @@ class crypto_TH
     unsigned char *keyexchange_nonce;
     unsigned long exp = RSA_F4; //65537
     int keybits = 2048;
+    unsigned char aes_key[AES_256_KEY_SIZE];
+    unsigned char aes_iv[AES_BLOCK_SIZE];
 
 public:
     void load_masterkey()
@@ -409,7 +415,82 @@ public:
     unsigned char *decrypt_update(unsigned char *payload, int payloadlen, int &updatelen)
     {
         cout << "Received update package of " << payloadlen << " bytes";
-        return NULL;
+
+        memcpy(aes_iv, payload + payloadlen - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+
+        if (RSA_private_decrypt(RSA_size(currentRSA), payload + payloadlen - (AES_BLOCK_SIZE + RSA_size(currentRSA)), aes_key, currentRSA, RSA_PKCS1_PADDING) == -1)
+        {
+            unsigned long errorTrack = ERR_get_error();
+            char *errorChar = new char[256];
+            errorChar = ERR_error_string(errorTrack, errorChar);
+            cout << errorChar << endl;
+            ERROR("RSA decrypt error");
+            exit(1);
+        }
+
+        int aes_dec_len;
+        unsigned char *aes_dec = AES_decrypt(payload, payloadlen - (AES_BLOCK_SIZE + RSA_size(currentRSA)), aes_dec_len);
+        cout << "AES decrypted " << aes_dec_len << " bytes\n";
+        free(payload);
+
+        updatelen = aes_dec[3] + 256 * aes_dec[2] + 256 * 256 * aes_dec[1] + 256 * 256 * 256 * aes_dec[0];
+
+        unsigned char *hash = (unsigned char *)malloc(SHA256_DIGEST_LENGTH);
+
+        if (SHA256(aes_dec + 4, 16 + updatelen, hash) == NULL)
+        {
+            ERROR("Hashing Error");
+            exit(1);
+        }
+
+        if (RSA_verify(NID_sha256, hash, SHA256_DIGEST_LENGTH, aes_dec + 4 + updatelen + 16, aes_dec_len - (4 + updatelen + 16), AdmincurrentRSA) != 1)
+        {
+            ERROR("Invalid signature.");
+            exit(1);
+        }
+        
+
+        return aes_dec;
+    }
+
+    unsigned char *AES_decrypt(unsigned char *aes_enc, int aes_enc_len, int &ret_len)
+    {
+
+        unsigned char *ret = (unsigned char *)malloc(aes_enc_len + AES_BLOCK_SIZE);
+        EVP_CIPHER_CTX *ctx;
+        ctx = EVP_CIPHER_CTX_new();
+
+        if (ctx == NULL)
+        {
+            ERROR("Error creating context");
+            exit(1);
+        }
+
+        if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, aes_key, aes_iv))
+        {
+            ERROR("CTX error");
+            exit(1);
+        }
+
+        assert(EVP_CIPHER_CTX_key_length(ctx) == AES_256_KEY_SIZE);
+        assert(EVP_CIPHER_CTX_iv_length(ctx) == AES_BLOCK_SIZE);
+
+        int len2;
+        if (!EVP_DecryptUpdate(ctx, ret, &len2, aes_enc, aes_enc_len))
+        {
+            ERROR("Error encrypting");
+            exit(1);
+        }
+        ret_len = len2;
+        if (!EVP_DecryptFinal_ex(ctx, aes_enc + len2, &len2))
+        {
+            ERROR("EVP final error");
+            exit(1);
+        }
+
+        ret_len += len2;
+
+        return ret;
     }
 };
 
@@ -436,7 +517,9 @@ public:
         payload = TCP_receive_update_package(sock, payloadlen);
         int update_bin_len;
         unsigned char *update_bin = crypto.decrypt_update(payload, payloadlen, update_bin_len);
-        free(payload);
+        write_to_flash(update_bin+4,update_bin_len);
+
+        
     }
 
 private:
@@ -494,6 +577,16 @@ private:
         }
 
         return payload;
+    }
+
+    void write_to_flash(unsigned char* data, int datalen)
+    {
+        FILE *fp=fopen("TH_fw.bin","wb");
+        for(int i=0;i<datalen;i++)
+        {
+            fwrite(data+i,1,sizeof(unsigned char),fp);
+        }
+        fclose(fp);
     }
 };
 
