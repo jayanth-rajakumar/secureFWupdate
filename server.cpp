@@ -13,9 +13,14 @@
 #include <openssl/aes.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include<errno.h>
+#include <errno.h>
+#include <sys/time.h>
 #include <iostream>
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
+char datetime[100];
+char datetime2[100];
+time_t t = time(NULL);
+struct timeval tv;
 
 #define AES_256_KEY_SIZE 32
 #define AES_BLOCK_SIZE 16
@@ -28,6 +33,14 @@
 
 using namespace std;
 
+char *getDateTime()
+{
+    strftime(datetime, sizeof(datetime), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    gettimeofday(&tv, NULL);
+    snprintf(datetime2, 100, "%s.%06ld", datetime, tv.tv_usec);
+
+    return datetime2;
+}
 class socket_admin
 {
 private:
@@ -45,6 +58,9 @@ public:
             ERROR("ERROR opening socket");
             exit(1);
         }
+        int temp_en = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &temp_en, sizeof(int)) < 0)
+            ERROR("setsockopt(SO_REUSEADDR) failed");
 
         bzero((char *)&serv_addr, sizeof(serv_addr));
 
@@ -98,13 +114,13 @@ public:
         while (total_bytes_written != size)
         {
             int bytes_written = write(newsockfd,
-                                      str+total_bytes_written,
+                                      str + total_bytes_written,
                                       size - total_bytes_written);
             if (bytes_written == -1)
             {
-              ERROR("ERROR writing to socket");
-              cout<<strerror(errno);
-              exit(1);
+                ERROR("ERROR writing to socket");
+                cout << strerror(errno);
+                exit(1);
             }
             total_bytes_written += bytes_written;
         }
@@ -179,7 +195,7 @@ public:
 
         if (fp != NULL)
         {
-            cout << "Keys found on disk, loading." << endl;
+            cout << getDateTime() << "> Keys found on disk, loading." << endl;
             masterRSA = PEM_read_RSAPublicKey(fp, NULL, NULL, NULL);
             fclose(fp);
             fp = fopen("ADMINMaster_prv.pem", "r");
@@ -230,6 +246,7 @@ public:
             ERROR("BIO Error");
             exit(1);
         }
+        cout << getDateTime() << "> Generated new Admin Master key. Please ensure that the file ADMINMaster_pub.pem is copied to root directory of the client" << endl;
 
         // RSA_print_fp(stdout, masterRSA, 0);
 
@@ -535,7 +552,7 @@ public:
         }
 
         payloadlen = fw_enc_len + RSA_size(THcurrentRSA) + AES_BLOCK_SIZE;
-        cout << "AES Encrypting " << 16 + filesize + siglen + 4<< " bytes\n";
+        cout << getDateTime() << "> AES Encrypting " << 16 + filesize + siglen + 4 << " bytes\n";
         unsigned char *payload = (unsigned char *)malloc(fw_enc_len + RSA_size(THcurrentRSA) + AES_BLOCK_SIZE);
         memcpy(payload, fw_enc, fw_enc_len);
         memcpy(payload + fw_enc_len, enc_aes_key, RSA_size(THcurrentRSA));
@@ -551,7 +568,7 @@ public:
 
     unsigned char *AES_encrypt(unsigned char *for_aes, int for_aes_len, int &fw_enc_len)
     {
-      
+
         unsigned char *fw_enc = (unsigned char *)malloc(for_aes_len + AES_BLOCK_SIZE);
         EVP_CIPHER_CTX *ctx;
         ctx = EVP_CIPHER_CTX_new();
@@ -608,34 +625,44 @@ public:
     void update_sequence(socket_admin &sock, crypto_admin &crypto)
     {
         TCP_wait_for_update_req(sock);
+        cout << getDateTime() << "> Received. Sending encrypted request for client's current public key." << endl;
         TCP_send_currentkey_request(sock, crypto);
         int payloadlen;
+        cout << getDateTime() << "> Waiting for client's current public key" << endl;
         unsigned char *payload = TCP_wait_for_currentkey(sock, payloadlen);
+        cout << getDateTime() << "> Received. Verifying digital signature." << endl;
         crypto.verify_gen_currentkey(payload, payloadlen);
+        cout << getDateTime() << "> Signature is valid." << endl;
         free(payload);
         payload = NULL;
+        cout << getDateTime() << "> Sending server's current public key." << endl;
         payload = crypto.send_Admincurrentkey(payloadlen);
         TCP_send_Admincurrentkey(sock, payload, payloadlen);
         free(payload);
         char filename[] = "fw.bin";
+        cout << getDateTime() << "> Preparing encrypted firmware update package." << endl;
         payload = crypto.prepare_update(filename, payloadlen);
+        cout << getDateTime() << "> Sending the update package to client." << endl;
         TCP_send_update(sock, payload, payloadlen);
         free(payload);
     }
 
     void TCP_wait_for_update_req(socket_admin &sock)
     {
+
+        cout << getDateTime() << "> Ready. Waiting for plaintext update request from client." << endl;
         unsigned char *payload = (unsigned char *)malloc(5);
         int psize = sock.read_str(payload, 5);
         if (psize != 5)
         {
             ERROR("Invalid header received");
+            cout << psize;
             exit(1);
         }
 
         if (payload[0] == UPDATE_REQUEST)
         {
-            cout << "Update Request received." << endl;
+
             free(payload);
             return;
         }
@@ -693,15 +720,18 @@ int main(int argc, char *argv[])
         ERROR("Port not entered")
         exit(1);
     }
-    crypto_admin crypto;
-    crypto.load_masterkey();
 
-    socket_admin sock;
-    sock.init(INADDR_ANY, atoi(argv[1]));
+    while (1)
+    {
+        crypto_admin crypto;
+        crypto.load_masterkey();
+        FW_update_server update;
+        socket_admin sock;
+        sock.init(INADDR_ANY, atoi(argv[1]));
 
-    FW_update_server update;
-    update.update_sequence(sock, crypto);
+        update.update_sequence(sock, crypto);
+        sock.close_tcp();
+    }
 
-    sock.close_tcp();
     return 0;
 }

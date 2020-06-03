@@ -13,6 +13,7 @@
 #include <openssl/evp.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <sys/time.h>
 
 #define UPDATE_REQUEST 0
 #define THMASTER_REQUEST 1
@@ -24,7 +25,21 @@
 #define AES_BLOCK_SIZE 16
 
 using namespace std;
+
 #define ERROR(fmt) printf("%s:%d: \n" fmt, __FILE__, __LINE__);
+char datetime[100];
+char datetime2[100];
+time_t t = time(NULL);
+struct timeval tv;
+
+char *getDateTime()
+{
+    strftime(datetime, sizeof(datetime), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    gettimeofday(&tv, NULL);
+    snprintf(datetime2, 100, "%s.%06ld", datetime, tv.tv_usec);
+
+    return datetime2;
+}
 
 class client_socket
 {
@@ -150,13 +165,41 @@ class crypto_TH
     unsigned char aes_iv[AES_BLOCK_SIZE];
 
 public:
+    void verify_nonce_unique(unsigned char *new_nonce)
+    {
+        FILE *fp = fopen("nonces.txt", "r");
+        unsigned char *line = (unsigned char*)malloc(16);
+
+        if (fp != NULL)
+        {
+            while ((fread(line,1,16,fp)) != 16)
+            {
+                if(memcmp(new_nonce,line,16)==0)
+                {
+                    ERROR("Reused nonce. Aborting...");
+                    exit(1);
+                }
+            }
+
+            fclose(fp);
+        }
+        
+
+        fp=fopen("nonces.txt","a");
+        if(fwrite(new_nonce,1,16,fp)!=16)
+        {
+            ERROR("Error writing nonce");
+        }
+        fclose(fp);
+    }
+
     void load_masterkey()
     {
         FILE *fp = fopen("THMaster_pub.pem", "r");
 
         if (fp != NULL)
         {
-            cout << "Keys found on disk, loading." << endl;
+            cout << getDateTime() << "> Keys found on disk, loading." << endl;
             masterRSA = PEM_read_RSAPublicKey(fp, NULL, NULL, NULL);
             fclose(fp);
             fp = fopen("THMaster_prv.pem", "r");
@@ -257,6 +300,8 @@ public:
     {
         unsigned char *dec_nonce = (unsigned char *)malloc(16);
 
+        
+
         if (RSA_private_decrypt(RSA_size(masterRSA), THMasterkey_request, dec_nonce, masterRSA, RSA_PKCS1_PADDING) == -1)
         {
             unsigned long errorTrack = ERR_get_error();
@@ -279,7 +324,9 @@ public:
             ERROR("Invalid signature created");
             exit(1);
         }
-        cout << "Request received and verified\n";
+
+        verify_nonce_unique(dec_nonce);
+
         free(hash);
         keyexchange_nonce = dec_nonce;
     }
@@ -414,7 +461,7 @@ public:
 
     unsigned char *decrypt_update(unsigned char *payload, int payloadlen, int &updatelen)
     {
-        cout << "Received update package of " << payloadlen << " bytes";
+        cout << getDateTime() << "> Received update package of " << payloadlen << " bytes\n";
 
         memcpy(aes_iv, payload + payloadlen - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
 
@@ -430,7 +477,7 @@ public:
 
         int aes_dec_len;
         unsigned char *aes_dec = AES_decrypt(payload, payloadlen - (AES_BLOCK_SIZE + RSA_size(currentRSA)), aes_dec_len);
-        cout << "AES decrypted " << aes_dec_len << " bytes\n";
+        cout << getDateTime() << "> AES decrypted to " << aes_dec_len << " bytes\n";
         free(payload);
 
         updatelen = aes_dec[3] + 256 * aes_dec[2] + 256 * 256 * aes_dec[1] + 256 * 256 * 256 * aes_dec[0];
@@ -448,7 +495,6 @@ public:
             ERROR("Invalid signature.");
             exit(1);
         }
-        
 
         return aes_dec;
     }
@@ -500,26 +546,31 @@ class FW_update_client
 public:
     void update_sequence(crypto_TH &crypto, client_socket &sock)
     {
+        cout << getDateTime() << "> Sending plaintext update request to server." << endl;
         TCP_send_update_request(sock);
         unsigned char *THMasterkey_request = NULL;
         int msgsize;
+        cout << getDateTime() << "> Waiting for Currentkey request from server." << endl;
         THMasterkey_request = TCP_wait_for_THMasterkey_request(sock, msgsize);
-
+        cout << getDateTime() << "> Received. Verifying signature on the request." << endl;
         crypto.verify_THMasterkey_request(sock, THMasterkey_request, msgsize);
+        cout << getDateTime() << "> Verified. Signature is valid. Generating and sending current public key." << endl;
         crypto.gen_currentkey();
         int payloadlen;
         unsigned char *payload = crypto.send_THcurrentkey(sock, payloadlen);
         TCP_send_THcurrentkey(sock, payload, payloadlen);
+        cout << getDateTime() << "> Waiting for server's current public key." << endl;
         free(payload);
         payload = TCP_wait_for_currentkey(sock, payloadlen);
         crypto.verify_load_admincurrentkey(payload, payloadlen);
+        cout << getDateTime() << "> Received and verified. Waiting for encrypted update package." << endl;
         free(payload);
         payload = TCP_receive_update_package(sock, payloadlen);
+        cout << getDateTime() << "> Received. Decrypting update package." << endl;
         int update_bin_len;
         unsigned char *update_bin = crypto.decrypt_update(payload, payloadlen, update_bin_len);
-        write_to_flash(update_bin+4,update_bin_len);
-
-        
+        cout << getDateTime() << "> Decryption finished. Writing to flash" << endl;
+        write_to_flash(update_bin + 4, update_bin_len);
     }
 
 private:
@@ -579,12 +630,12 @@ private:
         return payload;
     }
 
-    void write_to_flash(unsigned char* data, int datalen)
+    void write_to_flash(unsigned char *data, int datalen)
     {
-        FILE *fp=fopen("TH_fw.bin","wb");
-        for(int i=0;i<datalen;i++)
+        FILE *fp = fopen("TH_fw.bin", "wb");
+        for (int i = 0; i < datalen; i++)
         {
-            fwrite(data+i,1,sizeof(unsigned char),fp);
+            fwrite(data + i, 1, sizeof(unsigned char), fp);
         }
         fclose(fp);
     }
